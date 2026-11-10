@@ -2652,6 +2652,226 @@ static void test_json_ostream_nwrite_space(void)
 	str_free(&buffer);
 }
 
+/* Streamed strings must match one-shot output whatever the boundaries */
+
+#define BOUNDARY_PAYLOAD_MIN_SIZE 4000
+#define S(str) (const unsigned char *)(str), sizeof(str) - 1
+
+static const struct test_json_ostream_boundary_payload {
+	const char *name;
+	const unsigned char *unit;
+	size_t unit_len;
+	const unsigned char *tail;
+	size_t tail_len;
+} boundary_payloads[] = {
+	{ "escapes",
+	  S("a\"b\\c\n\t\x01" "d\x1f"), S("") },
+	{ "utf8",
+	  S("a\xc3\xa9" "b\xe2\x82\xac" "c\xf0\x9f\x98\x80"), S("") },
+	{ "quotes+utf8",
+	  S("\"\xc3\xa9\\\xe2\x82\xac\"\xf0\x9f\x98\x80\xe2\x80\xa8"), S("") },
+	{ "invalid utf8",
+	  S("a\x80" "b\xc3\x28" "c\xe2\x82\x28" "d\xf0\x9f\x28"
+	    "e\xf0\x9f\x98" "f\xff" "g\xed\xa0\x80"), S("") },
+	{ "truncated tail",
+	  S("\xc3\xa9\xe2\x82\xac"), S("\xe2\x82") },
+	{ "truncated 4-byte tail",
+	  S("x\xf0\x9f\x98\x80"), S("\xf0\x9f\x98") },
+};
+
+/* Both sides of where the string ostream drops its own buffer (6*256);
+   6 fits the longest escape */
+static const size_t boundary_max_buffer_sizes[] = {
+	6, 7, 8, 9, 10, 11, 12, 13,
+	1536, 1537, 1538, 1539, 1540, 1541, 1542, 1543, 8192,
+};
+static const size_t boundary_chunk_sizes[] = {
+	1, 2, 3, 5, 7, 1000, 8192, SIZE_MAX,
+};
+
+static void
+test_json_ostream_boundary_reference(string_t *out,
+				     const unsigned char *data, size_t size)
+{
+	struct json_ostream *joutput;
+
+	joutput = json_ostream_create_str(out, 0);
+	json_ostream_ndescend_object(joutput, NULL);
+	json_ostream_nwrite_string_data(joutput, "text", data, size);
+	json_ostream_nascend_object(joutput);
+	test_assert(json_ostream_nfinish(joutput) == 0);
+	json_ostream_destroy(&joutput);
+}
+
+static void
+test_json_ostream_boundary_ostream(string_t *out,
+				   const unsigned char *data, size_t size,
+				   size_t max_buffer_size, size_t chunk)
+{
+	struct ostream *output, *str_stream;
+	struct json_ostream *joutput;
+	size_t pos, n;
+
+	/* Like doveadm-print-json */
+	output = test_ostream_create_nonblocking(out, max_buffer_size);
+	joutput = json_ostream_create(output, 0);
+	json_ostream_ndescend_object(joutput, NULL);
+	str_stream = json_ostream_nopen_string_stream(joutput, "text");
+	o_stream_set_no_error_handling(str_stream, TRUE);
+	for (pos = 0; pos < size; pos += n) {
+		n = I_MIN(chunk, size - pos);
+		o_stream_nsend(str_stream, data + pos, n);
+	}
+	test_assert(o_stream_flush(str_stream) > 0);
+	o_stream_destroy(&str_stream);
+	json_ostream_nascend_object(joutput);
+	test_assert(json_ostream_nfinish(joutput) == 0);
+	json_ostream_destroy(&joutput);
+	o_stream_destroy(&output);
+}
+
+static void
+test_json_ostream_boundary_istream(string_t *out,
+				   const unsigned char *data, size_t size,
+				   size_t max_buffer_size, size_t chunk)
+{
+	struct ostream *output;
+	struct istream *input;
+	struct json_ostream *joutput;
+
+	output = test_ostream_create_nonblocking(out, max_buffer_size);
+	input = test_istream_create_data(data, size);
+	test_istream_set_max_buffer_size(input, I_MIN(chunk, size));
+	joutput = json_ostream_create(output, 0);
+	json_ostream_ndescend_object(joutput, NULL);
+	json_ostream_nwrite_string_stream(joutput, "text", input);
+	i_stream_unref(&input);
+	json_ostream_nascend_object(joutput);
+	test_assert(json_ostream_nfinish(joutput) == 0);
+	json_ostream_destroy(&joutput);
+	o_stream_destroy(&output);
+}
+
+struct test_json_ostream_trickle {
+	struct ostream *output;
+	size_t limit;
+	unsigned int stalls;
+};
+
+static void
+test_json_ostream_trickle_more(struct test_json_ostream_trickle *trickle)
+{
+	trickle->limit += 3;
+	o_stream_set_max_buffer_size(trickle->output, trickle->limit);
+	trickle->stalls++;
+}
+
+#define TRICKLE(trickle, expr) STMT_START { \
+	int _tret; \
+	while ((_tret = (expr)) == 0 && (trickle)->stalls < 1000000) \
+		test_json_ostream_trickle_more(trickle); \
+	test_assert(_tret > 0); \
+	} STMT_END
+
+static void
+test_json_ostream_boundary_trickle(string_t *out,
+				   const unsigned char *data, size_t size,
+				   size_t chunk)
+{
+	struct test_json_ostream_trickle trickle;
+	struct ostream *str_stream;
+	struct json_ostream *joutput;
+	size_t pos;
+	ssize_t sret;
+
+	/* Output really fills up, so sends must be retried */
+	i_zero(&trickle);
+	trickle.output = o_stream_create_buffer(out);
+	o_stream_set_max_buffer_size(trickle.output, 0);
+	joutput = json_ostream_create(trickle.output, 0);
+	TRICKLE(&trickle, json_ostream_descend_object(joutput, NULL));
+	TRICKLE(&trickle, json_ostream_open_string_stream(joutput, "text",
+							  &str_stream));
+	for (pos = 0; pos < size && trickle.stalls < 1000000; ) {
+		sret = o_stream_send(str_stream, data + pos,
+				     I_MIN(chunk, size - pos));
+		test_assert(sret >= 0);
+		if (sret < 0)
+			break;
+		pos += (size_t)sret;
+		if (sret == 0)
+			test_json_ostream_trickle_more(&trickle);
+	}
+	test_assert(pos == size);
+	TRICKLE(&trickle, o_stream_finish(str_stream));
+	o_stream_destroy(&str_stream);
+	TRICKLE(&trickle, json_ostream_ascend_object(joutput));
+	TRICKLE(&trickle, json_ostream_flush(joutput));
+	json_ostream_destroy(&joutput);
+	o_stream_destroy(&trickle.output);
+}
+
+static void test_json_ostream_string_boundary(void)
+{
+	string_t *expected = str_new(default_pool, 16384);
+	string_t *actual = str_new(default_pool, 16384);
+	buffer_t *payload = buffer_create_dynamic(default_pool,
+		BOUNDARY_PAYLOAD_MIN_SIZE + 64);
+	unsigned int i, j, k;
+
+	for (i = 0; i < N_ELEMENTS(boundary_payloads); i++) {
+		const struct test_json_ostream_boundary_payload *p =
+			&boundary_payloads[i];
+
+		buffer_set_used_size(payload, 0);
+		while (payload->used < BOUNDARY_PAYLOAD_MIN_SIZE)
+			buffer_append(payload, p->unit, p->unit_len);
+		buffer_append(payload, p->tail, p->tail_len);
+
+		str_truncate(expected, 0);
+		test_json_ostream_boundary_reference(
+			expected, payload->data, payload->used);
+
+		test_begin(t_strdup_printf(
+			"json ostream string boundary - %s", p->name));
+		for (j = 0; j < N_ELEMENTS(boundary_max_buffer_sizes); j++) {
+			size_t max_size = boundary_max_buffer_sizes[j];
+
+			for (k = 0; k < N_ELEMENTS(boundary_chunk_sizes); k++) {
+				size_t chunk = boundary_chunk_sizes[k];
+
+				str_truncate(actual, 0);
+				test_json_ostream_boundary_ostream(
+					actual, payload->data, payload->used,
+					max_size, chunk);
+				test_assert_strcmp_idx(str_c(expected),
+						       str_c(actual),
+						       j * 100 + k);
+
+				str_truncate(actual, 0);
+				test_json_ostream_boundary_istream(
+					actual, payload->data, payload->used,
+					max_size, chunk);
+				test_assert_strcmp_idx(str_c(expected),
+						       str_c(actual),
+						       j * 100 + k);
+			}
+		}
+		for (k = 0; k < N_ELEMENTS(boundary_chunk_sizes); k++) {
+			str_truncate(actual, 0);
+			test_json_ostream_boundary_trickle(
+				actual, payload->data, payload->used,
+				boundary_chunk_sizes[k]);
+			test_assert_strcmp_idx(str_c(expected),
+					       str_c(actual), 10000 + k);
+		}
+		test_end();
+	}
+	buffer_free(&payload);
+	str_free(&actual);
+	str_free(&expected);
+}
+
 int main(int argc, char *argv[])
 {
 	int c;
@@ -2662,6 +2882,7 @@ int main(int argc, char *argv[])
 		test_json_ostream_write_tree,
 		test_json_ostream_nwrite_tree,
 		test_json_ostream_nwrite_space,
+		test_json_ostream_string_boundary,
 		NULL
 	};
 
